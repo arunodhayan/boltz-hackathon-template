@@ -1,44 +1,57 @@
 #!/usr/bin/env python3
-import argparse
 import os
 import sys
 import subprocess
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Optional
+from typing import Optional
 import pandas as pd
 
-from hackathon_api import Datapoint
+# =========================================================
+# ⚙️ Folder Configuration
+# =========================================================
+BASE_DIR = Path("hackathon_data")
+GT_DIR = BASE_DIR / "datasets" / "abag_public" / "ground_truth"
+SUBMISSION_DIR = BASE_DIR / "submission" / "abag_public"
+RESULTS_DIR = BASE_DIR / "evaluation" / "abag_public"
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
-def parse_args():
-    parser = argparse.ArgumentParser(description="Parallel CAPRI-Q evaluation runner (Python port)")
-    parser.add_argument('--dataset-file', type=str, default=str(Path.cwd() / 'inputs'), help='Path to input JSONL file')
-    parser.add_argument('--result-folder', type=str, default=str(Path.cwd() / 'outputs'), help='Directory to store result files')
-    parser.add_argument('--submission-folder', type=str, default=str(Path.cwd() / 'predictions'), help='Directory containing prediction files')
-    parser.add_argument('--njobs', type=int, default=50, help='Number of parallel jobs to run')
-    parser.add_argument('--nsamples', type=int, default=5, help='Number of samples to evaluate per structure')
-    return parser.parse_args()
+# Number of models per target (e.g., model_0.pdb … model_4.pdb)
+NSAMPLES = 5
+NTHREADS = 20  # parallel CAPRI-Q containers
 
-
-def run_evaluation(gt_dir, gt_structures: dict[str, Any], structure_name: str, i: int, args) -> Optional[pd.DataFrame]:
-    output_subdir = Path(args.result_folder) / f"{structure_name}_{i}"
+# =========================================================
+# 🧮 CAPRI-Q Docker evaluation
+# =========================================================
+def run_evaluation(target_id: str, model_index: int) -> Optional[pd.DataFrame]:
+    """Run CAPRI-Q evaluation for one model."""
+    output_subdir = RESULTS_DIR / f"{target_id}_{model_index}"
     output_subdir.mkdir(parents=True, exist_ok=True)
-    prediction_file = Path(args.submission_folder) / structure_name / f"model_{i}.pdb"
+    prediction_file = SUBMISSION_DIR / target_id / f"model_{model_index}.pdb"
+
     if not prediction_file.exists():
-        print(f"No prediction file {prediction_file} found. Skipping.")
+        print(f"⚠️ Prediction {prediction_file} missing.")
         return None
-    
+
+    # expected GT files
+    gt_complex = GT_DIR / f"{target_id}_complex.pdb"
+    gt_ab = GT_DIR / f"{target_id}_Ab.pdb"
+    gt_lig = GT_DIR / f"{target_id}_ligand.pdb"
+
+    if not gt_complex.exists() or not gt_ab.exists() or not gt_lig.exists():
+        print(f"⚠️ Missing GT components for {target_id}.")
+        return None
 
     capriq_cmd = [
         "/capri-q/bin/capriq",
         "-a", "--dontwrite",
-        "-t", f"/app/ground_truth/{gt_structures['structure_complex']}",
-        "-u", f"/app/ground_truth/{gt_structures['structure_ab']}",
-        "-u", f"/app/ground_truth/{gt_structures['structure_ligand']}",
+        "-t", f"/app/ground_truth/{gt_complex.name}",
+        "-u", f"/app/ground_truth/{gt_ab.name}",
+        "-u", f"/app/ground_truth/{gt_lig.name}",
         "-z", "/app/outputs/",
         "-p", "65",
-        "-o", f"/app/outputs/{structure_name}_{i}_results.txt",
-        "-l", f"/app/outputs/{structure_name}_{i}_errors.txt",
+        "-o", f"/app/outputs/{target_id}_{model_index}_results.txt",
+        "-l", f"/app/outputs/{target_id}_{model_index}_errors.txt",
         f"/app/predictions/prediction.pdb",
         "&&",
         "chown", "-R", f"{os.getuid()}:{os.getgid()}", "/app/outputs"
@@ -46,88 +59,89 @@ def run_evaluation(gt_dir, gt_structures: dict[str, Any], structure_name: str, i
 
     docker_cmd = [
         "docker", "run", "--group-add", str(os.getgid()), "--rm", "--network", "none",
-        "-v", f"{Path(gt_dir).absolute()}:/app/ground_truth/",
+        "-v", f"{GT_DIR.absolute()}:/app/ground_truth/",
         "-v", f"{output_subdir.absolute()}:/app/outputs",
         "-v", f"{prediction_file.absolute()}:/app/predictions/prediction.pdb",
         "gitlab-registry.in2p3.fr/cmsb-public/capri-q",
-        "/bin/bash", "-c", 
-        f"{' '.join(capriq_cmd)}"
+        "/bin/bash", "-c", " ".join(capriq_cmd)
     ]
-    print(f"Evaluating {structure_name} model {i}... Prediction file: {prediction_file}")
-    # print(f"Docker command: {' '.join(docker_cmd)}")
+
+    print(f"🚀 Evaluating {target_id} model {model_index}")
     try:
         subprocess.run(docker_cmd, check=True)
     except subprocess.CalledProcessError as e:
-        print(f"Docker run failed for {structure_name} model {i}. Error: {e}", file=sys.stderr)
+        print(f"❌ CAPRI-Q failed for {target_id} model {model_index}: {e}")
         return pd.DataFrame({
-            'structure_name': [structure_name],
-            'structure_index': [i],
-            'nclash': [None],
-            'clash_fraction': [None],
-            'classification': ['error'],
-            'error': [str(e)]
+            "target": [target_id],
+            "model_index": [model_index],
+            "classification": ["error"],
+            "error": [str(e)]
         })
 
-    # load result file
-    result_file = output_subdir / f"{structure_name}_{i}_results.txt"
+    result_file = output_subdir / f"{target_id}_{model_index}_results.txt"
     if not result_file.exists():
-        print(f"No result file {result_file} found. Skipping.")
         return pd.DataFrame({
-            'structure_name': [structure_name],
-            'structure_index': [i],
-            'nclash': [None],
-            'clash_fraction': [None],
-            'classification': ['error'],
-            'error': ['Result file not found']
+            "target": [target_id],
+            "model_index": [model_index],
+            "classification": ["error"],
+            "error": ["Result file not found"]
         })
-    
-    df = pd.read_csv(result_file, sep='\\s+')
-    df['clash_fraction'] = df['model'].str.replace("/", "").astype(float) / df['nclash']
-    df['nclash'] = df['model'].str.replace("/", "").astype(int)
-    df.drop(columns=['model'], inplace=True)
-    df['structure_name'] = structure_name
-    df['structure_index'] = i
-    return df
 
-def load_dataset(input_jsonl: str) -> list[Datapoint]:
-    with open(input_jsonl, 'r') as f:
-        data = [Datapoint.from_json(line) for line in f]
-    return data
+    try:
+        df = pd.read_csv(result_file, sep=r"\s+")
+        df["target"] = target_id
+        df["model_index"] = model_index
+        return df
+    except Exception as e:
+        print(f"⚠️ Failed to parse results for {target_id} model {model_index}: {e}")
+        return pd.DataFrame({
+            "target": [target_id],
+            "model_index": [model_index],
+            "classification": ["error"],
+            "error": [str(e)]
+        })
 
+# =========================================================
+# 🧠 Parallel Evaluation Loop
+# =========================================================
 def main():
-    args = parse_args()
-    input_jsonl = args.dataset_file
-    dataset = load_dataset(input_jsonl)
-    gt_dir = Path(args.dataset_file).parent / 'ground_truth'
+    targets = sorted([d.name for d in SUBMISSION_DIR.iterdir() if d.is_dir()])
     result_dfs = []
-    with ThreadPoolExecutor(max_workers=args.njobs) as executor:
+
+    with ThreadPoolExecutor(max_workers=NTHREADS) as executor:
         futures = []
-        for datapoint in dataset:
-            structure_name = datapoint.datapoint_id
-            gt_structures = datapoint.ground_truth
-            for i in range(args.nsamples):
-                futures.append(executor.submit(run_evaluation, gt_dir, gt_structures, structure_name, i, args))
-        for future in as_completed(futures):
-            result = future.result()
-            if result is not None:
-                result_dfs.append(result)
-    combined_results = pd.concat(result_dfs, ignore_index=True)
-    combined_results.to_csv(Path(args.result_folder) / 'combined_results.csv', index=False)
+        for target_id in targets:
+            for i in range(NSAMPLES):
+                futures.append(executor.submit(run_evaluation, target_id, i))
 
-    # select structure 0 and count "classification"
-    nsuccessful = 0
-    good_classes = ['high', 'medium', 'acceptable']
-    bad_classes = ['incorrect', 'error']
-    for classification in good_classes + bad_classes:
-        n = len(combined_results[(combined_results['structure_index'] == 0) & (combined_results['classification'].str.contains(classification))])
-        if classification in good_classes:
-            nsuccessful += n
-        print(f"Number of {classification} classifications in top 1: {n}")
+        for fut in as_completed(futures):
+            res = fut.result()
+            if res is not None:
+                result_dfs.append(res)
 
-    # print number of successful top 1 predictions
-    print(f"Number of successful top 1 predictions: {nsuccessful} out of {len(dataset)}")
-    
+    if not result_dfs:
+        print("❌ No evaluations completed.")
+        return
+
+    combined = pd.concat(result_dfs, ignore_index=True)
+    combined.to_csv(RESULTS_DIR / "combined_results.csv", index=False)
+
+    # Classification summary for top-1 models (model_0)
+    n_successful = 0
+    good = ["high", "medium", "acceptable"]
+    bad = ["incorrect", "error"]
+
+    print("\n===== CAPRI-Q Evaluation Summary =====")
+    for label in good + bad:
+        n = len(combined[(combined["model_index"] == 0) & (combined["classification"].str.contains(label, case=False, na=False))])
+        print(f"Number of {label} classifications in top 1: {n}")
+        if label in good:
+            n_successful += n
+
+    print(f"\n✅ Number of successful top-1 predictions: {n_successful} out of {len(targets)}")
     print("All evaluations completed.")
+    print(f"💾 Results saved to {RESULTS_DIR/'combined_results.csv'}")
 
 if __name__ == "__main__":
     main()
+
